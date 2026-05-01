@@ -7,3 +7,4 @@ pesq
 pystoi
 mir_eval
 scipy
+python-multipart
