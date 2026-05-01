@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+numpy
+soundfile
+librosa
+pesq
+pystoi
+mir_eval
+scipy
