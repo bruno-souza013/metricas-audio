@@ -7,152 +7,113 @@ from pesq import pesq
 from pystoi import stoi
 import mir_eval
 import io
+import os
 from typing import Tuple
 
 app = FastAPI(title="CalmWave Audio Benchmark API")
 
-MAX_FILE_BYTES = 10 * 1024 * 1024
-TARGET_SAMPLE_RATE = 16000
-MIN_AUDIO_SAMPLES = 4000
-
-
 def read_audio_bytes(content: bytes) -> Tuple[np.ndarray, int]:
-    """Decode an uploaded audio file and return samples and sample rate."""
+    # sf.read aceita file-like
     data, sr = sf.read(io.BytesIO(content))
-    if not isinstance(sr, (int, np.integer)) or sr <= 0:
-        raise ValueError("Invalid sample rate")
-    data = np.asarray(data, dtype=np.float64)
-    if data.size == 0 or not np.isfinite(data).all():
-        raise ValueError("Audio is empty or contains invalid numeric values")
-    return data, int(sr)
+    return np.asarray(data), int(sr)
 
+def to_mono(x: np.ndarray) -> np.ndarray:
+    if x.ndim > 1:
+        return np.mean(x, axis=1)
+    return x
 
-def to_mono(audio: np.ndarray) -> np.ndarray:
-    """Convert [samples, channels] audio to mono before resampling."""
-    if audio.ndim > 1:
-        return np.mean(audio, axis=1)
-    return audio
+def align_and_resample(ref_audio, deg_audio, sr_ref, sr_deg, target_sr=16000):
+    # Garante float64 (librosa espera floats)
+    ref_audio = np.asarray(ref_audio, dtype=np.float64)
+    deg_audio = np.asarray(deg_audio, dtype=np.float64)
 
-
-def safe_round(value):
-    """Return a finite metric rounded to three decimals, or None."""
-    if value is None:
-        return None
-    numeric = float(value)
-    if not np.isfinite(numeric):
-        return None
-    return round(numeric, 3)
-
-
-def align_and_resample(
-    ref_audio: np.ndarray,
-    deg_audio: np.ndarray,
-    sr_ref: int,
-    sr_deg: int,
-    target_sr: int = TARGET_SAMPLE_RATE,
-) -> Tuple[np.ndarray, np.ndarray, int]:
-    # Convert to mono first: soundfile returns multichannel audio as [samples, channels].
-    # librosa.resample operates on the last axis by default, so resampling stereo first
-    # would otherwise resample across channels rather than across time.
-    ref_audio = to_mono(np.asarray(ref_audio, dtype=np.float64))
-    deg_audio = to_mono(np.asarray(deg_audio, dtype=np.float64))
-
-    if sr_ref <= 0 or sr_deg <= 0 or target_sr <= 0:
-        raise ValueError("Sample rates must be positive")
-
+    # Resample se necessário
     if sr_ref != target_sr:
-        ref_audio = librosa.resample(
-            ref_audio, orig_sr=sr_ref, target_sr=target_sr
-        )
+        ref_audio = librosa.resample(ref_audio, orig_sr=sr_ref, target_sr=target_sr)
     if sr_deg != target_sr:
-        deg_audio = librosa.resample(
-            deg_audio, orig_sr=sr_deg, target_sr=target_sr
-        )
+        deg_audio = librosa.resample(deg_audio, orig_sr=sr_deg, target_sr=target_sr)
 
-    # Compare the common interval after both signals have the same sample rate.
+    # Mono
+    ref_audio = to_mono(ref_audio)
+    deg_audio = to_mono(deg_audio)
+
+    # Align by shortest
     min_len = min(len(ref_audio), len(deg_audio))
     ref_audio = ref_audio[:min_len]
     deg_audio = deg_audio[:min_len]
+
     return ref_audio, deg_audio, target_sr
 
-
 @app.post("/benchmark")
-async def benchmark(
-    clean_file: UploadFile = File(...),
-    denoised_file: UploadFile = File(...),
-):
+async def benchmark(clean_file: UploadFile = File(...), denoised_file: UploadFile = File(...)):
     try:
-        # Read at most MAX_FILE_BYTES + 1 to reject large uploads without
-        # loading an arbitrarily large file fully into memory.
-        clean_content = await clean_file.read(MAX_FILE_BYTES + 1)
-        denoised_content = await denoised_file.read(MAX_FILE_BYTES + 1)
+        # leitura
+        clean_content = await clean_file.read()
+        denoised_content = await denoised_file.read()
 
-        if len(clean_content) > MAX_FILE_BYTES or len(denoised_content) > MAX_FILE_BYTES:
+        # limites simples (por segurança)
+        max_bytes = 10 * 1024 * 1024  # 10 MB
+        if len(clean_content) > max_bytes or len(denoised_content) > max_bytes:
             raise HTTPException(status_code=413, detail="File too large")
 
+        ref, sr_ref = read_audio_bytes(clean_content)
+        deg, sr_deg = read_audio_bytes(denoised_content)
+
+        # garantir arrays válidos
+        if ref.size < 1600 or deg.size < 1600:
+            raise HTTPException(status_code=400, detail="Audio muito curto para análise")
+
+        # Resample/alinhamento (uso 16k por padrão para PESQ wideband)
+        ref_proc, deg_proc, final_sr = align_and_resample(ref, deg, sr_ref, sr_deg, target_sr=16000)
+
+        # PESQ (pode lançar erro se inputs inválidos)
         try:
-            ref, sr_ref = read_audio_bytes(clean_content)
-            deg, sr_deg = read_audio_bytes(denoised_content)
-        except (RuntimeError, ValueError, OSError) as exc:
-            raise HTTPException(
-                status_code=400,
-                detail="Não foi possível ler um dos arquivos como áudio válido.",
-            ) from exc
-
-        ref_proc, deg_proc, final_sr = align_and_resample(
-            ref, deg, sr_ref, sr_deg, target_sr=TARGET_SAMPLE_RATE
-        )
-
-        if len(ref_proc) < MIN_AUDIO_SAMPLES:
-            raise HTTPException(
-                status_code=400,
-                detail="Áudio muito curto para uma avaliação confiável; envie ao menos 0,25 s.",
-            )
-
-        # Some metrics can reject particular signals. Report unavailable metrics as null.
-        try:
-            score_pesq = pesq(final_sr, ref_proc, deg_proc, "wb")
-        except Exception:
+            score_pesq = pesq(final_sr, ref_proc, deg_proc, 'wb')
+        except Exception as e:
+            # fallback ou informar que PESQ falhou
             score_pesq = None
 
+        # STOI
         try:
             score_stoi = stoi(ref_proc, deg_proc, final_sr, extended=False)
         except Exception:
             score_stoi = None
 
+        # SDR (em dB) usando mir_eval
         try:
+            # mir_eval espera shape (nsrc, nsamples)
             sdr_arr, _, _, _ = mir_eval.separation.bss_eval_sources(
                 ref_proc.reshape(1, -1),
                 deg_proc.reshape(1, -1),
-                compute_permutation=False,
+                compute_permutation=False
             )
             sdr_db = float(sdr_arr[0])
         except Exception:
             sdr_db = None
 
-        return {
-            "pesq": safe_round(score_pesq),
-            "stoi": safe_round(score_stoi),
-            "sdr": safe_round(sdr_db),
-            "status": "success",
+        # Monta resposta com chaves simples no root (facilita app)
+        result = {
+            "pesq": round(float(score_pesq), 3) if score_pesq is not None else None,
+            "stoi": round(float(score_stoi), 3) if score_stoi is not None else None,
+            "sdr": round(float(sdr_db), 3) if sdr_db is not None else None,
+            "status": "success"
         }
+
+        return result
 
     except HTTPException:
         raise
-    except Exception:
-        # Avoid exposing internal exception details in API responses.
-        raise HTTPException(
-            status_code=500,
-            detail="Erro interno ao calcular as métricas de áudio.",
-        )
+    except Exception as e:
+        # log simples
+        print("Erro: ", str(e))
+        raise HTTPException(status_code=500, detail="Erro interno ao calcular métricas: " + str(e))
 
-
-@app.get("/test")
+@app.get('/test')
 async def test():
     return {
         "status": "ok",
         "message": "Rota de teste funcionando",
-        "api": "CalmWave Audio Benchmark API",
+        "api": "CalmWave Audio Benchmark API"
     }
 
 
