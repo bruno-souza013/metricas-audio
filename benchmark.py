@@ -34,6 +34,16 @@ def to_mono(audio: np.ndarray) -> np.ndarray:
     return audio
 
 
+def safe_round(value):
+    """Return a finite metric rounded to three decimals, or None."""
+    if value is None:
+        return None
+    numeric = float(value)
+    if not np.isfinite(numeric):
+        return None
+    return round(numeric, 3)
+
+
 def align_and_resample(
     ref_audio: np.ndarray,
     deg_audio: np.ndarray,
@@ -121,9 +131,9 @@ async def benchmark(
             sdr_db = None
 
         return {
-            "pesq": round(float(score_pesq), 3) if score_pesq is not None else None,
-            "stoi": round(float(score_stoi), 3) if score_stoi is not None else None,
-            "sdr": round(float(sdr_db), 3) if sdr_db is not None else None,
+            "pesq": safe_round(score_pesq),
+            "stoi": safe_round(score_stoi),
+            "sdr": safe_round(sdr_db),
             "status": "success",
         }
 
